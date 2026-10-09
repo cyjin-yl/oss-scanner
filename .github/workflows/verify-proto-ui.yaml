@@ -1,0 +1,108 @@
+name: Verify Proto UI scanner enrollment
+on:
+  push:
+    branches: [verify/proto-ui-enrollment]
+permissions: {}
+jobs:
+  validate-build-offline-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 145
+    env:
+      ENROLLMENT_SHA: 953cb3aec8d3eafa7dbd19f2399864db74ca481c
+      SCANNER_SHA: 481b73cc028deee0409d09c6aca619b614553880
+      PROJECT_SHA: 169407b2d463d5da5d6694e2d1f8644578046b40
+      CI: '1'
+      HUSKY: '0'
+    steps:
+      - name: Fetch exact public enrollment and verify official tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -c credential.helper= clone --no-checkout https://github.com/cyjin-yl/oss-scanner.git scanner
+          git -C scanner checkout --detach "$ENROLLMENT_SHA"
+          test "$(git -C scanner rev-parse HEAD)" = "$ENROLLMENT_SHA"
+          git -C scanner diff --exit-code "$SCANNER_SHA" "$ENROLLMENT_SHA" -- tools
+          python3 -m venv "$RUNNER_TEMP/validator-venv"
+          "$RUNNER_TEMP/validator-venv/bin/pip" install --disable-pip-version-check PyYAML==6.0.2
+          "$RUNNER_TEMP/validator-venv/bin/python" scanner/tools/validate.py
+      - name: Run unmodified official checker and verify offline shell exit status
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/verify.py" <<'PY'
+          import json, os, pathlib, shutil, subprocess, sys
+          root = pathlib.Path.cwd()
+          work = pathlib.Path(os.environ['RUNNER_TEMP']) / 'scanner-verification'
+          work.mkdir()
+          shims = work / 'bin'
+          shims.mkdir()
+          receipt = work / 'offline-shell-result.json'
+          git = shutil.which('git')
+          docker = shutil.which('docker')
+          if not git or not docker:
+              raise SystemExit('git and docker are required')
+          common = '#!/usr/bin/python3\nimport json, os, pathlib, subprocess, sys\n'
+          (shims / 'git').write_text(common + f'''
+          args = sys.argv[1:]
+          code = subprocess.call([{git!r}, *args])
+          if code == 0 and 'clone' in args:
+              directory = args[-1]
+              actual = subprocess.check_output([{git!r}, '-C', directory, 'rev-parse', 'HEAD'], text=True).strip()
+              print('CLONED_PROJECT_SHA=' + actual, flush=True)
+              if actual != os.environ['PROJECT_SHA']:
+                  print('Ref moved: refusing to execute unapproved project revision', file=sys.stderr)
+                  code = 97
+          sys.exit(code)
+          ''')
+          (shims / 'docker').write_text(common + f'''
+          args = sys.argv[1:]
+          shell = bool(args and args[0] == 'run' and args[-2:] == ['oss-scanner-check/built:proto-ui', 'bash'])
+          if shell:
+              if '--network' not in args or args[args.index('--network') + 1] != 'none':
+                  raise SystemExit('Offline shell must use --network none')
+              if any(arg in args for arg in ('-v', '--volume', '--mount')):
+                  raise SystemExit('Offline shell must not mount host files')
+              if pathlib.Path({str(receipt)!r}).exists():
+                  raise SystemExit('Unexpected duplicate offline shell')
+          code = subprocess.call([{docker!r}, *args])
+          if shell:
+              pathlib.Path({str(receipt)!r}).write_text(json.dumps({{'docker_shell_exit_code': code, 'network': 'none', 'host_mounts': False, 'project_sha': os.environ['PROJECT_SHA']}}))
+          sys.exit(code)
+          ''')
+          for path in shims.iterdir():
+              path.chmod(0o755)
+          shell_commands = '''set -uo pipefail
+          cd /src
+          printf 'OFFLINE_SOURCE_SHA='
+          git rev-parse HEAD
+          node --version
+          corepack pnpm@10.32.1 --version
+          chromium --version
+          dpkg-query -W nodejs chromium 2>/dev/null || true
+          failed=0
+          for command in check:types test:types test:release test:runtime test; do
+            printf '\\n=== OFFLINE CHECK %s ===\\n' "$command"
+            case "$command" in
+              check:types) limit=10m ;;
+              test:types) limit=5m ;;
+              test:release) limit=10m ;;
+              test:runtime) limit=25m ;;
+              test) limit=40m ;;
+            esac
+            timeout --signal=TERM --kill-after=30s "$limit" corepack pnpm@10.32.1 "$command"
+            code=$?
+            printf '\\nOFFLINE_CHECK_EXIT %s %s\\n' "$command" "$code"
+            if [ "$code" -ne 0 ]; then failed=1; fi
+          done
+          exit "$failed"
+          '''
+          env = dict(os.environ)
+          env['PATH'] = str(shims) + os.pathsep + env['PATH']
+          result = subprocess.run([sys.executable, str(root / 'scanner/tools/check'), 'proto-ui', '--dir', str(work / 'build')], cwd=root / 'scanner', env=env, input=shell_commands, text=True)
+          outcome = {'enrollment_sha': os.environ['ENROLLMENT_SHA'], 'scanner_sha': os.environ['SCANNER_SHA'], 'project_sha': os.environ['PROJECT_SHA'], 'official_check_exit_code': result.returncode, 'offline_shell': json.loads(receipt.read_text()) if receipt.exists() else None}
+          print('VERIFICATION_RECEIPT=' + json.dumps(outcome, sort_keys=True), flush=True)
+          if result.returncode != 0 or not outcome['offline_shell'] or outcome['offline_shell']['docker_shell_exit_code'] != 0:
+              raise SystemExit('Validation/build/offline shell did not all succeed; no checklist completion')
+          subprocess.run([docker, 'image', 'inspect', 'oss-scanner-check/built:proto-ui', '--format', '{{.Id}}'], check=True)
+          PY
+          "$RUNNER_TEMP/validator-venv/bin/python" "$RUNNER_TEMP/verify.py"
