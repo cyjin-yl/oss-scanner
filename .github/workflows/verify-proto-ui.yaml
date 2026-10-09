@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 70
     env:
-      ENROLLMENT_SHA: e4323b96af324e6fce8c61e0778c841a77cc17ea
+      ENROLLMENT_SHA: 1bdba583014deefd8b63738b28a4d2123531f43e
       SCANNER_SHA: 481b73cc028deee0409d09c6aca619b614553880
       PROJECT_SHA: 7e28d06f26150513d6096f0c24e59b871ae8ae62
       CI: '1'
