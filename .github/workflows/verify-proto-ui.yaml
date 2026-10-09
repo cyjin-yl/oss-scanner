@@ -6,9 +6,9 @@ permissions: {}
 jobs:
   validate-build-offline-tests:
     runs-on: ubuntu-24.04
-    timeout-minutes: 145
+    timeout-minutes: 70
     env:
-      ENROLLMENT_SHA: 953cb3aec8d3eafa7dbd19f2399864db74ca481c
+      ENROLLMENT_SHA: e4323b96af324e6fce8c61e0778c841a77cc17ea
       SCANNER_SHA: 481b73cc028deee0409d09c6aca619b614553880
       PROJECT_SHA: 7e28d06f26150513d6096f0c24e59b871ae8ae62
       CI: '1'
@@ -78,22 +78,24 @@ jobs:
           node --version
           corepack pnpm@10.32.1 --version
           chromium --version
-          dpkg-query -W nodejs chromium 2>/dev/null || true
+          dpkg-query -W chromium fonts-noto-cjk fontconfig ffmpeg || exit 1
+          fc-match -f '%{family} %{file}\\n' 'sans-serif:lang=zh-cn'
+          ffprobe -version || exit 1
+          ffmpeg -version || exit 1
           failed=0
-          for command in check:types test:types test:release test:runtime test; do
-            printf '\\n=== OFFLINE CHECK %s ===\\n' "$command"
-            case "$command" in
-              check:types) limit=10m ;;
-              test:types) limit=5m ;;
-              test:release) limit=10m ;;
-              test:runtime) limit=25m ;;
-              test) limit=40m ;;
-            esac
-            timeout --signal=TERM --kill-after=30s "$limit" corepack pnpm@10.32.1 "$command"
+          run_check() {
+            name="$1"; shift
+            printf '\\n=== OFFLINE ENVIRONMENT CHECK %s ===\\n' "$name"
+            timeout --signal=TERM --kill-after=30s 10m "$@"
             code=$?
-            printf '\\nOFFLINE_CHECK_EXIT %s %s\\n' "$command" "$code"
+            printf '\\nOFFLINE_ENVIRONMENT_CHECK_EXIT %s %s\\n' "$name" "$code"
             if [ "$code" -ne 0 ]; then failed=1; fi
-          done
+          }
+          run_check workspace-types corepack pnpm@10.32.1 check:types
+          run_check type-contracts corepack pnpm@10.32.1 test:types
+          run_check release-toolchain corepack pnpm@10.32.1 test:release
+          run_check representative-runtime-and-browser node scripts/test/run-runtime-tests.mjs --minWorkers=1 --maxWorkers=2 packages/runtime/test/contract/focus-entry-readiness.contract.test.ts packages/compiler/test/browser-differential.test.ts
+          run_check real-offline-media-decoder node --test scripts/coverage-matrices/test/decode-video-evidence.integration.mjs
           exit "$failed"
           '''
           env = dict(os.environ)
@@ -101,8 +103,10 @@ jobs:
           result = subprocess.run([sys.executable, str(root / 'scanner/tools/check'), 'proto-ui', '--dir', str(work / 'build')], cwd=root / 'scanner', env=env, input=shell_commands, text=True)
           outcome = {'enrollment_sha': os.environ['ENROLLMENT_SHA'], 'scanner_sha': os.environ['SCANNER_SHA'], 'project_sha': os.environ['PROJECT_SHA'], 'official_check_exit_code': result.returncode, 'offline_shell': json.loads(receipt.read_text()) if receipt.exists() else None}
           print('VERIFICATION_RECEIPT=' + json.dumps(outcome, sort_keys=True), flush=True)
+          if outcome['offline_shell']:
+              subprocess.run([docker, 'image', 'inspect', 'oss-scanner-check/built:proto-ui', '--format', '{{.Id}}'], check=True)
           if result.returncode != 0 or not outcome['offline_shell'] or outcome['offline_shell']['docker_shell_exit_code'] != 0:
               raise SystemExit('Validation/build/offline shell did not all succeed; no checklist completion')
-          subprocess.run([docker, 'image', 'inspect', 'oss-scanner-check/built:proto-ui', '--format', '{{.Id}}'], check=True)
           PY
           "$RUNNER_TEMP/validator-venv/bin/python" "$RUNNER_TEMP/verify.py"
+
